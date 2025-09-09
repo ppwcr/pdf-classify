@@ -1,0 +1,16 @@
+# Core runtime
+PyMuPDF>=1.23.0
+Pillow>=9.5.0
+mlx-vlm>=0.1.0
+# mlx-lm is not required now, kept here if you also use text-only models
+# mlx-lm>=0.16.0
+
+# OCR backends (optional; script works without them)
+# Prefer installing pytesseract and having Tesseract binary available.
+# On macOS you can install the binary via: brew install tesseract
+pytesseract>=0.3.10
+
+# EasyOCR fallback (optional). Note: pulls heavy deps (torch, torchvision).
+# Uncomment if you want EasyOCR.
+# easyocr>=1.7.1
+# numpy>=1.24.0
