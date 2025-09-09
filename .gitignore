@@ -1,0 +1,3 @@
+# Ignore generated output
+out/
+vlm_ocr_out/

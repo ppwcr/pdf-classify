@@ -180,6 +180,79 @@ def ocr_text_and_boxes(img: Image.Image) -> Tuple[str, List[Dict]]:
     full_text = " ".join(texts)
     return full_text, words
 
+def clean_ocr_text(words: List[Dict]) -> str:
+    """Group OCR words into readable lines and clean spacing.
+    - Filters very low-confidence tokens
+    - Sorts by y then x, groups into lines using median word height
+    - Normalizes spaces and hyphen spacing
+    """
+    if not words:
+        return ""
+    # Filter extremely low-confidence tokens and blanks
+    toks = [w for w in words if isinstance(w.get("text"), str) and w.get("text").strip()]
+    if not toks:
+        return ""
+    # Confidence filter (keep if conf unknown or >= 50)
+    kept = []
+    for w in toks:
+        try:
+            if float(w.get("conf", 0)) < 50:
+                continue
+        except Exception:
+            pass
+        kept.append(w)
+    if not kept:
+        kept = toks
+    # Sort by line (y center), then x
+    for w in kept:
+        w["_yc"] = int(w.get("y", 0)) + int(w.get("h", 0)) / 2.0
+    kept.sort(key=lambda w: (w.get("_yc", 0), int(w.get("x", 0))))
+    # Median height for line threshold
+    try:
+        import statistics as _st
+        med_h = float(_st.median([int(w.get("h", 0)) or 0 for w in kept if int(w.get("h", 0)) > 0]) or 12.0)
+    except Exception:
+        med_h = 12.0
+    line_thresh = max(6.0, 0.7 * med_h)
+    # Group into lines
+    lines: List[List[str]] = []
+    cur_y = None
+    cur: List[str] = []
+    for w in kept:
+        t = str(w.get("text", "")).strip()
+        if not t:
+            continue
+        yc = float(w.get("_yc", 0.0))
+        if cur_y is None:
+            cur_y = yc
+        # New line if vertical gap is big
+        if abs(yc - cur_y) > line_thresh and cur:
+            lines.append(cur)
+            cur = [t]
+            cur_y = yc
+        else:
+            cur.append(t)
+            # track slowly varying baseline
+            cur_y = (cur_y * 0.8) + (yc * 0.2)
+    if cur:
+        lines.append(cur)
+    # Join words per line and normalize hyphen spacing
+    out_lines: List[str] = []
+    for ws in lines:
+        s = " ".join(ws)
+        s = re.sub(r"\s*-\s*", "-", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        if s:
+            out_lines.append(s)
+    # Deduplicate consecutive identical lines
+    final_lines: List[str] = []
+    prev = None
+    for s in out_lines:
+        if s != prev:
+            final_lines.append(s)
+            prev = s
+    return "\n".join(final_lines)
+
 # ----------------------------- LLM Post-process --------------------------
 
 LLM_SYSTEM = (
@@ -397,7 +470,9 @@ def process_pdf(pdf_path: Path,
             crop = img.crop((x0, y0, x1, y1))
 
             # OCR full text + word boxes in crop-local coordinates
-            text, words_local = ocr_text_and_boxes(crop)
+            raw_text, words_local = ocr_text_and_boxes(crop)
+            # Clean and group OCR into readable lines
+            text = clean_ocr_text(words_local) or (raw_text or "")
 
             # Map crop-local boxes -> page-absolute pixels and normalized page coords
             words_abs: List[Dict] = []
@@ -531,20 +606,18 @@ def write_csv(csv_path: Path, rows: List[Dict]):
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     cols = [
         "pdf_path", "page_index", "page_width", "page_height",
-        "drawing_no", "ocr_text", "ocr_words_json", "notes",
+        "drawing_no", "notes",
         # LLM postprocess (flattened convenience columns)
         "llm_used", "llm_json",
         "llm_drawing_no", "llm_sheet_name", "llm_drawing_title", "llm_project", "llm_discipline", "llm_revision", "llm_scale", "llm_date",
-        # Place ocr_text_snippet as the last column
-        "ocr_text_snippet",
+        # Place ocr_text as the last column
+        "ocr_text",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         for r in rows:
             out = {k: r.get(k) for k in cols}
-            # Serialize word boxes for CSV (JSON string)
-            out["ocr_words_json"] = json.dumps(r.get("ocr_words", []), ensure_ascii=False)
             llm = r.get("llm_class") or {}
             out["llm_used"] = r.get("llm_used", False)
             out["llm_json"] = json.dumps(llm, ensure_ascii=False)
