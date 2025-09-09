@@ -23,7 +23,7 @@ Note:
 
 source .venv/bin/activate
 python pdf_ocr_raster.py \
-  --folder "/Users/ppwcr/Desktop/print_pages/Test" \
+  --folder "/Users/ppwcr/Desktop/print_pages" \
   --out-jsonl ./out/raster_results.jsonl \
   --out-csv   ./out/raster_results.csv \
   --dpi 200 --detect-pages 3 --debug --debug-dir ./out/debug

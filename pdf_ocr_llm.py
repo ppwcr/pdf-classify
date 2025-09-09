@@ -605,30 +605,20 @@ def write_jsonl(jsonl_path: Path, rows: List[Dict]):
 def write_csv(csv_path: Path, rows: List[Dict]):
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     cols = [
-        "pdf_path", "page_index", "page_width", "page_height",
-        "drawing_no", "notes",
-        # LLM postprocess (flattened convenience columns)
-        "llm_used", "llm_json",
-        "llm_drawing_no", "llm_sheet_name", "llm_drawing_title", "llm_project", "llm_discipline", "llm_revision", "llm_scale", "llm_date",
-        # Place ocr_text as the last column
-        "ocr_text",
+        "pdf_path",
+        "llm_json",
+        "ocr_text_snippet",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         for r in rows:
-            out = {k: r.get(k) for k in cols}
             llm = r.get("llm_class") or {}
-            out["llm_used"] = r.get("llm_used", False)
-            out["llm_json"] = json.dumps(llm, ensure_ascii=False)
-            out["llm_drawing_no"] = llm.get("drawing_no", "")
-            out["llm_sheet_name"] = llm.get("sheet_name", "")
-            out["llm_drawing_title"] = llm.get("drawing_title", "")
-            out["llm_project"] = llm.get("project", "")
-            out["llm_discipline"] = llm.get("discipline", "")
-            out["llm_revision"] = llm.get("revision", "")
-            out["llm_scale"] = llm.get("scale", "")
-            out["llm_date"] = llm.get("date", "")
+            out = {
+                "pdf_path": r.get("pdf_path", ""),
+                "llm_json": json.dumps(llm, ensure_ascii=False),
+                "ocr_text_snippet": r.get("ocr_text_snippet", ""),
+            }
             w.writerow(out)
 
 

@@ -52,6 +52,107 @@ def points_to_pixels(rect_points: tuple[float, float, float, float], dpi: int) -
     return (int(round(x0 * scale)), int(round(y0 * scale)),
             int(round(x1 * scale)), int(round(y1 * scale)))
 
+# --- Title-block region prior & token utilities ---
+def in_titleblock_region(x0: float, y0: float, x1: float, y1: float, page_w: float, page_h: float) -> bool:
+    """Heuristic prior: title block usually bottom band or right band."""
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    return (cy >= 0.75 * page_h) or (cx >= 0.80 * page_w)  # bottom 25% or rightmost 20%
+
+DASHES = "\u2010\u2011\u2012\u2013\u2014\u2212"  # various unicode dashes
+_dash_re = re.compile(f"[{DASHES}]")
+_spaces_re = re.compile(r"\s+")
+
+def normalize_token(s: str) -> str:
+    """Collapse spaces and normalize every dash variant to '-'."""
+    s = s.strip()
+    s = _dash_re.sub("-", s)
+    s = _spaces_re.sub("", s)
+    return s
+
+def group_tokens_and_match(words_roi, dpi, compiled_patterns, y_tol_pt: float = 3.0, gap_tol_pt: float = 6.0):
+    """
+    Group neighboring tokens on the same line, merge tiny gaps, normalize, and regex-match.
+    words_roi: list of tuples (x0, y0, x1, y1, text, ...)
+    Returns list of dict {text, bbox_points, bbox_pixels}
+    """
+    if not words_roi:
+        return []
+
+    # Sort by (line-y, then x)
+    words_sorted = sorted(words_roi, key=lambda w: (round((w[1] + w[3]) * 0.5, 1), w[0]))
+
+    # Bucket into lines by y centroid tolerance
+    lines = []
+    for w in words_sorted:
+        x0, y0, x1, y1, t, *_ = w
+        cy = 0.5 * (y0 + y1)
+        if not lines:
+            lines.append([w])
+            continue
+        cy_last = 0.5 * (lines[-1][-1][1] + lines[-1][-1][3])
+        if abs(cy - cy_last) <= y_tol_pt:
+            lines[-1].append(w)
+        else:
+            lines.append([w])
+
+    results = []
+    for ln in lines:
+        ln.sort(key=lambda w: w[0])  # left to right
+        # Merge tokens across tiny x gaps
+        cur = list(ln[0])
+        merged = []
+        for w in ln[1:]:
+            gap = w[0] - cur[2]
+            if gap <= gap_tol_pt:
+                # extend bbox
+                cur[2] = max(cur[2], w[2])
+                cur[1] = min(cur[1], w[1])
+                cur[3] = max(cur[3], w[3])
+                cur[4] = f"{cur[4]} {w[4]}"  # keep a space; we'll normalize later
+            else:
+                merged.append(cur)
+                cur = list(w)
+        merged.append(cur)
+
+        # Normalize and match
+        for x0, y0, x1, y1, t, *_ in merged:
+            t_norm = normalize_token(str(t))
+            if any(p.search(t_norm) for p in compiled_patterns):
+                x0i, y0i, x1i, y1i = points_to_pixels((x0, y0, x1, y1), dpi)
+                results.append({
+                    "text": t_norm,
+                    "bbox_points": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+                    "bbox_pixels": {"x0": x0i, "y0": y0i, "x1": x1i, "y1": y1i},
+                })
+    return results
+
+def _iou(a, b) -> float:
+    ax0, ay0, ax1, ay1 = a["bbox_pixels"]["x0"], a["bbox_pixels"]["y0"], a["bbox_pixels"]["x1"], a["bbox_pixels"]["y1"]
+    bx0, by0, bx1, by1 = b["bbox_pixels"]["x0"], b["bbox_pixels"]["y0"], b["bbox_pixels"]["x1"], b["bbox_pixels"]["y1"]
+    inter_w = max(0, min(ax1, bx1) - max(ax0, bx0))
+    inter_h = max(0, min(ay1, by1) - max(ay0, by0))
+    inter = inter_w * inter_h
+    if inter == 0:
+        return 0.0
+    area_a = (ax1 - ax0) * (ay1 - ay0)
+    area_b = (bx1 - bx0) * (by1 - by0)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+def dedup_candidates(cands, iou_thresh: float = 0.6):
+    """Merge duplicates that overlap heavily."""
+    out = []
+    for c in cands:
+        keep = True
+        for o in out:
+            if _iou(c, o) >= iou_thresh and c["text"] == o["text"]:
+                keep = False
+                break
+        if keep:
+            out.append(c)
+    return out
+
 def find_label_candidates(words):
     # Return centroids of words that look like label hints (DRAWING / NO / NUMBER / SHEET / เลขที่แบบ)
     hints = []
@@ -88,23 +189,34 @@ def pick_best_match(matches, label_points):
     return matches[-1]
 
 def detect_all_on_page(page: fitz.Page, dpi: int, patterns):
-    """
-    Return a list of all candidates that match the drawing number patterns on this page.
-    Each item is a dict with keys: text, bbox_points, bbox_pixels
-    """
     words = words_on_page(page)
+    W, H = page.rect.width, page.rect.height
+
+    # 1) Heuristic: keep only title-block-ish words
+    words_roi = [(x0, y0, x1, y1, w, *_rest) for (x0, y0, x1, y1, w, *_rest) in words if in_titleblock_region(x0, y0, x1, y1, W, H)]
+
+    # A) Diagnostic: if there is almost no text in the ROI, warn (likely outlined/rasterized)
+    if len(words_roi) < 3:
+        print("[titleblock] little/no vector text in ROI -> likely outlined/rasterized; consider OCR fallback", flush=True)
+
     results = []
-    for (x0, y0, x1, y1, w, *_rest) in words:
-        text = w.strip()
-        if not text:
-            continue
-        if any(p.search(text) for p in patterns):
-            pix = points_to_pixels((x0, y0, x1, y1), dpi)
+
+    # 2) Direct word-level matches in ROI (with normalization)
+    for (x0, y0, x1, y1, w, *_rest) in words_roi:
+        text_norm = normalize_token(str(w))
+        if text_norm and any(p.search(text_norm) for p in patterns):
+            x0i, y0i, x1i, y1i = points_to_pixels((x0, y0, x1, y1), dpi)
             results.append({
-                "text": text,
+                "text": text_norm,
                 "bbox_points": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
-                "bbox_pixels": {"x0": pix[0], "y0": pix[1], "x1": pix[2], "y1": pix[3]},
+                "bbox_pixels": {"x0": x0i, "y0": y0i, "x1": x1i, "y1": y1i},
             })
+
+    # 3) Line-grouping + merge tiny gaps, then match (handles split tokens like 'A 1 - 01')
+    results += group_tokens_and_match(words_roi, dpi, patterns)
+
+    # 4) Deduplicate overlapping results
+    results = dedup_candidates(results, iou_thresh=0.6)
     return results
 
 def save_viz(page: fitz.Page, dpi: int, bbox_px: dict, out_path: Path):
