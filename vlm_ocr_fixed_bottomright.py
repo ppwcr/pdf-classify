@@ -11,14 +11,13 @@ Simple, fast pipeline:
 Example (Ollama):
   # ollama pull qwen2.5vl:7b
   python vlm_ocr_fixed_bottomright.py \
-    --folder "/Users/ppwcr/Desktop/print_pages" \
-    --out-jsonl ./out/fixed_br.jsonl \
-    --out-csv   ./out/fixed_br.csv \
-    --dpi 300 \
+    --folder '/Users/ppwcr/Desktop/คุณTao/01 CAD Submission/01 PDF' \
+    --out-jsonl ./out/tao_fixed_bl.jsonl \
+    --out-csv   ./out/ta0_fixed_bl.csv \
+    --dpi 96 \
     --llm-provider ollama \
     --llm-base-url http://localhost:11434 \
     --llm-model qwen2.5vl:7b \
-    --debug
 
 OpenAI-compatible vision:
   export OPENAI_API_KEY=...
@@ -121,21 +120,25 @@ def _parse_relaxed_json(s: str) -> Dict:
 
 
 SYSTEM = (
-    "You are a strict OCR+IE assistant for construction drawing title blocks. "
+    "You are a strict OCR+information-extraction assistant for construction drawing title blocks. "
     "You will receive a cropped image from the bottom-right region of a page. "
-    "Return only valid JSON with keys: drawing_no, drawing_title, scale, total_page. "
-    "Rules: If a field is not visible, return an empty string; prefer exact text near labels; normalize spaces; no extra keys; no explanations. "
-    "drawing_title must be the descriptive sheet/drawing name (e.g., PLAN, SECTION, ELEVATION, or a longer Thai/English title). "
-    "Do NOT place page counts (e.g., 'TOTAL PAGE 10/10', '1/10', 'PAGE 1') or labels like SHEET/PAGE/SCALE/REV/DATE/PROJECT into drawing_title."
+    "Return ONLY valid JSON with keys: drawing_no, drawing_title, scale, total_page. No extra keys, no explanations. "
+    "Field rules: "
+    "- drawing_no: Prefer the official number near labels like 'DRAWING NO'/'DWG NO' (Thai: 'เลขที่แบบ'). Normalize spaces/dashes (e.g., A-101, SN-08, E-05). "
+    "- drawing_title: The sheet/drawing name to the right of or immediately under the 'TITLE' label (Thai: 'ชื่อแบบ', 'หัวข้อ'). If multiple lines, choose the most descriptive title text. "
+    "  Avoid putting page counts (e.g., '1/10', 'TOTAL PAGE'), sheet numbers, scale, revision, date, project, or material/spec strings (e.g., 'RB9mm @ 0.15m', 'Ø12', 'dia 12', '@0.20m') into drawing_title. "
+    "  If drawing_no suggests a discipline (A/S/E/SN/MEP), prefer a title consistent with that (e.g., A: PLAN/ELEVATION/SECTION; E: LINE DIAGRAM/RISER/SYMBOLS; SN: STRUCTURAL DETAIL/SECTION). "
+    "- scale: Prefer colon format like '1:100' or '1:75'; convert '1/100' to '1:100'. If the page explicitly says 'NOT TO SCALE' or 'NTS', leave scale as an empty string. "
+    "- total_page: Format as '<current>/<total>' (e.g., '1/10' or '17/71')."
 )
 
 
 def build_user_prompt() -> str:
     return (
-        "Extract fields from this title-block crop. "
-        "Preferred anchors: 'DRAWING NO', 'DWG NO', 'TITLE', 'SCALE', 'SHEET', 'PAGE' (and Thai equivalents). "
-        "Return only JSON with keys: drawing_no, drawing_title, scale, total_page. "
-        "Format total_page as '<current>/<total>' (e.g., '1/10')."
+        "Extract fields from this title-block crop using labels near the bottom-right area. "
+        "Anchors: 'DRAWING NO'/'DWG NO', 'TITLE', 'SCALE', 'SHEET'/'PAGE' (Thai: 'เลขที่แบบ', 'ชื่อแบบ', 'หัวข้อ', 'มาตราส่วน', 'หน้าที่'). "
+        "Return ONLY JSON with keys: drawing_no, drawing_title, scale, total_page. "
+        "Ensure drawing_title is a proper name (not page/scale/spec). Format total_page as '<current>/<total>'."
     )
 
 
@@ -250,8 +253,17 @@ def clean_title(s: str) -> str:
     t = s.strip()
     if not t:
         return ""
-    # Remove common anchors and tail after them (e.g., TOTAL PAGE 10/10)
+    # Remove anchors and trailing metadata (TOTAL PAGE, PAGE, SHEET, SCALE, REV, DATE, PROJECT)
     t = re.sub(r"(?i)\b(TOTAL\s+PAGES?|SHEET\s*NO\.?|SHEET:?|PAGE\s*NO\.?|PAGE:?|SCALE|REV(?:ISION)?|DATE|PROJECT)\b.*", "", t).strip()
+    # If comma-separated, drop segments that look like material/spec lines
+    parts = [p.strip() for p in re.split(r"[,;\n]", t) if p.strip()]
+    if len(parts) > 1:
+        spec_pat = re.compile(r"(?i)(\bRB\d|Ø\d|D\d|dia\b|@\s?\d|\bmm\b|\bkg\b|\bm\.?\b|\d+\.\d+|\d+\s*[xX]\s*\d+)")
+        keep = [p for p in parts if not spec_pat.search(p)]
+        if keep:
+            t = max(keep, key=len)
+        else:
+            t = parts[0]
     # Collapse spaces
     t = re.sub(r"\s+", " ", t)
     # Drop too-short or obviously wrong
@@ -260,6 +272,24 @@ def clean_title(s: str) -> str:
     if re.fullmatch(r"[\W_]+", t):
         return ""
     return t
+
+
+def normalize_scale(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    t = s.strip()
+    if not t:
+        return ""
+    if re.search(r"(?i)\b(NOT\s*TO\s*SCALE|NTS)\b", t):
+        return ""
+    # replace slash with colon if likely a scale
+    t = re.sub(r"\s*/\s*", ":", t)
+    t = re.sub(r"\s+", "", t)
+    # keep only patterns like 1:100 or 1:1 or 1:75
+    m = re.match(r"^(\d{1,3}):(\d{1,4})$", t)
+    if m:
+        return f"{int(m.group(1))}:{int(m.group(2))}"
+    return ""
 
 
 def resize_max_side(img: Image.Image, max_side: int) -> Image.Image:
@@ -277,7 +307,7 @@ def process_pdf(pdf_path: Path, dpi: int, bbox: BBox, crop_pad: float, max_side:
     rows: List[Dict] = []
     with fitz.open(pdf_path) as doc:
         n = doc.page_count
-        print(f"[INFO] PDF: {pdf_path.name} | pages: {n}")
+        print(f"[INFO] PDF: {pdf_path.name} | pages: {n}", flush=True)
         if debug_dir is not None:
             debug_dir.mkdir(parents=True, exist_ok=True)
         pbar = _tqdm(total=n, desc=f"{pdf_path.name}", unit="page") if _tqdm else None
@@ -286,6 +316,9 @@ def process_pdf(pdf_path: Path, dpi: int, bbox: BBox, crop_pad: float, max_side:
             crop = resize_max_side(crop, max_side)
             if debug_dir is not None:
                 crop.save(debug_dir / f"{pdf_path.stem}_p{i:03d}_brcrop.png")
+            if pbar is None:
+                # Fallback progress output when tqdm is unavailable
+                print(f"  - {pdf_path.name}: page {i+1}/{n}", flush=True)
             user = build_user_prompt()
             if provider == "ollama":
                 obj = call_ollama_vision_json(
@@ -311,7 +344,7 @@ def process_pdf(pdf_path: Path, dpi: int, bbox: BBox, crop_pad: float, max_side:
             # normalize result
             drawing_no = str(obj.get("drawing_no") or "").strip()
             raw_title = str(obj.get("drawing_title") or "").strip()
-            scale = str(obj.get("scale") or "").replace(" ", "").strip()
+            scale = normalize_scale(str(obj.get("scale") or ""))
             raw_total = str(obj.get("total_page") or "").strip()
             # Normalize to '<current>/<total>'
             cp, tp = None, None
@@ -337,70 +370,9 @@ def process_pdf(pdf_path: Path, dpi: int, bbox: BBox, crop_pad: float, max_side:
                 cp, tp = str(i + 1), str(n)
             total_page = f"{cp}/{tp}"
 
-            # Clean title; if missing or contaminated by PAGE/SHEET/SCALE, do a targeted second pass
+            # Clean title; keep fast: no extra VLM pass by default
             title = clean_title(raw_title)
-            need_title_fallback = not title or re.search(r"(?i)\b(TOTAL\s+PAGES?|PAGE|SHEET|SCALE)\b", raw_title)
-            # First try a position-aware sub-crop for title region (center band of title block)
-            title_sub = crop_rel(crop, 0.08, 0.18, 0.96, 0.70)
-            if provider == "ollama":
-                t_band = call_ollama_vision_text(
-                    base_url=llm_params.get("base_url", "http://localhost:11434"),
-                    model=llm_params.get("model", "qwen2.5vl:7b"),
-                    prompt=(
-                        "Return ONLY the drawing title (the descriptive sheet/drawing name) from this region. "
-                        "It is the text to the right of or immediately below the label 'TITLE' (Thai: 'ชื่อแบบ', 'หัวข้อ'). "
-                        "Do NOT include page counts (e.g., 1/10, TOTAL PAGE), sheet numbers, scale, date, revision, or project info."
-                    ),
-                    image=title_sub,
-                    temperature=float(llm_params.get("temperature", 0.0)),
-                    timeout_s=int(llm_params.get("timeout_s", 30)),
-                )
-            else:
-                t_band = call_openai_vision_text(
-                    base_url=llm_params.get("base_url", getenv_str("OPENAI_BASE_URL", "https://api.openai.com/v1")),
-                    api_key=llm_params.get("api_key", getenv_str(llm_params.get("api_key_env", "OPENAI_API_KEY"), "")),
-                    model=llm_params.get("model", getenv_str("OPENAI_MODEL", "gpt-4o-mini")),
-                    prompt=(
-                        "Return ONLY the drawing title (the descriptive sheet/drawing name) from this region. "
-                        "It is the text to the right of or immediately below the label 'TITLE' (Thai: 'ชื่อแบบ', 'หัวข้อ'). "
-                        "Do NOT include page counts (e.g., 1/10, TOTAL PAGE), sheet numbers, scale, date, revision, or project info."
-                    ),
-                    image=title_sub,
-                    temperature=float(llm_params.get("temperature", 0.0)),
-                    timeout_s=int(llm_params.get("timeout_s", 30)),
-                )
-            t_band = clean_title(t_band)
-            if t_band:
-                title = t_band
-            if need_title_fallback and not title:
-                prompt_title = (
-                    "Return ONLY the drawing title (the descriptive sheet/drawing name). "
-                    "Do NOT return page counts (e.g., 1/10, TOTAL PAGE), sheet numbers, scale, date, revision, or project info."
-                )
-                if provider == "ollama":
-                    t_only = call_ollama_vision_text(
-                        base_url=llm_params.get("base_url", "http://localhost:11434"),
-                        model=llm_params.get("model", "qwen2.5vl:7b"),
-                        prompt=prompt_title,
-                        image=crop,
-                        temperature=float(llm_params.get("temperature", 0.0)),
-                        timeout_s=int(llm_params.get("timeout_s", 30)),
-                    )
-                else:
-                    t_only = call_openai_vision_text(
-                        base_url=llm_params.get("base_url", getenv_str("OPENAI_BASE_URL", "https://api.openai.com/v1")),
-                        api_key=llm_params.get("api_key", getenv_str(llm_params.get("api_key_env", "OPENAI_API_KEY"), "")),
-                        model=llm_params.get("model", getenv_str("OPENAI_MODEL", "gpt-4o-mini")),
-                        prompt=prompt_title,
-                        image=crop,
-                        temperature=float(llm_params.get("temperature", 0.0)),
-                        timeout_s=int(llm_params.get("timeout_s", 30)),
-                    )
-                t_only = clean_title(t_only)
-                if t_only:
-                    title = t_only
-            if debug_dir is not None:
-                title_sub.save(debug_dir / f"{pdf_path.stem}_p{i:03d}_titleband.png")
+            # No extra VLM calls by default to keep things fast.
 
             out = {
                 "drawing_no": drawing_no,
@@ -475,12 +447,29 @@ def main():
 
     folder = Path(args.folder).expanduser().resolve()
     if not folder.exists():
-        print(f"[ERROR] Folder not found: {folder}", file=sys.stderr)
+        print(f"[ERROR] Path not found: {folder}", file=sys.stderr)
         sys.exit(2)
 
-    pdfs = sorted([p for p in folder.iterdir() if p.suffix.lower() == ".pdf"])
+    pdfs: List[Path] = []
+    if folder.is_file() and folder.suffix.lower() == ".pdf":
+        pdfs = [folder]
+    elif folder.is_dir():
+        # Top-level search first
+        pdfs = sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"])
+        # Fallback to recursive search if none found at top-level
+        if not pdfs:
+            pdfs = sorted(folder.rglob("*.pdf"))
+            if pdfs:
+                print(f"[INFO] No top-level PDFs; using recursive scan: found {len(pdfs)} PDFs", flush=True)
+    else:
+        print(f"[ERROR] Path is neither a directory nor a PDF: {folder}", file=sys.stderr)
+        sys.exit(2)
+
     if not pdfs:
-        print(f"[WARN] No PDFs in {folder}")
+        print(f"[WARN] No PDFs found under {folder}", file=sys.stderr)
+        sys.exit(0)
+    else:
+        print(f"[INFO] Found {len(pdfs)} PDF(s) to process", flush=True)
 
     bbox = BBox(x=args.bbox_x, y=args.bbox_y, w=args.bbox_w, h=args.bbox_h)
     debug_dir = Path(args.debug_dir) if args.debug else None
@@ -498,21 +487,24 @@ def main():
 
     all_rows: List[Dict] = []
     for pdf in pdfs:
-        rows = process_pdf(
-            pdf_path=pdf,
-            dpi=args.dpi,
-            bbox=bbox,
-            crop_pad=args.crop_pad,
-            max_side=args.max_side,
-            provider=args.llm_provider,
-            llm_params=llm_params,
-            debug_dir=debug_dir,
-        )
-        all_rows.extend(rows)
+        try:
+            rows = process_pdf(
+                pdf_path=pdf,
+                dpi=args.dpi,
+                bbox=bbox,
+                crop_pad=args.crop_pad,
+                max_side=args.max_side,
+                provider=args.llm_provider,
+                llm_params=llm_params,
+                debug_dir=debug_dir,
+            )
+            all_rows.extend(rows)
+        except Exception as e:
+            print(f"[WARN] Skipping {pdf.name} due to error: {e}", file=sys.stderr)
 
     write_jsonl(Path(args.out_jsonl), all_rows)
     write_csv(Path(args.out_csv), all_rows)
-    print(f"Done. JSONL: {args.out_jsonl} | CSV: {args.out_csv}")
+    print(f"Done. JSONL: {args.out_jsonl} | CSV: {args.out_csv}", flush=True)
 
 
 if __name__ == "__main__":
