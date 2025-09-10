@@ -22,7 +22,7 @@ Note:
 
 
 source .venv/bin/activate
-python pdf_ocr_raster.py \
+python pdf_ocr_raster_bbox.py \
   --folder "/Users/ppwcr/Desktop/print_pages" \
   --out-jsonl ./out/raster_results.jsonl \
   --out-csv   ./out/raster_results.csv \
